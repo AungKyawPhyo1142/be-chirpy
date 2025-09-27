@@ -50,6 +50,7 @@ func (api *apiConfig) middlewareMetricInc(next http.Handler) http.Handler {
 	})
 }
 
+// ------------------- Users --------------------------
 type CreateUserRequest struct {
 	Email string `json:"email"`
 }
@@ -104,6 +105,101 @@ func (api *apiConfig) HandlerResetUsers(w http.ResponseWriter, r *http.Request) 
 
 }
 
+// ------------------- Chirps --------------------------
+type CreateChirpRequest struct {
+	Body   string `json:"body"`
+	UserId string `json:"user_id"`
+}
+
+type ChirpResponse struct {
+	Body      string    `json:"body"`
+	UserId    string    `json:"user_id"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	ID        uuid.UUID `json:"id"`
+}
+
+func (apiCfg *apiConfig) CreateChirpHandler(w http.ResponseWriter, r *http.Request) {
+	decoder := json.NewDecoder(r.Body)
+	req_body := CreateChirpRequest{}
+
+	if err := decoder.Decode(&req_body); err != nil {
+		log.Printf("error decoding request body: %s", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+
+	if len(req_body.Body) > 140 {
+		helpers.ResponseWithError(w, http.StatusBadRequest, "Chirp is too long")
+		return
+	}
+
+	cleaned := helpers.ReplaceProfanity(req_body.Body)
+
+	chirp, err := apiCfg.DB.CreateChirp(r.Context(), database.CreateChirpParams{
+		Body:   cleaned,
+		UserID: uuid.MustParse(req_body.UserId),
+	})
+	if err != nil {
+		log.Printf("error creating chirp: %s", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't create chirp")
+		return
+	}
+
+	helpers.ResponseWithJSON(w, http.StatusCreated, ChirpResponse{
+		Body:      chirp.Body,
+		UserId:    chirp.UserID.String(),
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+		ID:        chirp.ID,
+	})
+
+}
+
+func (apiCfg *apiConfig) GetAllChirpsHandler(w http.ResponseWriter, r *http.Request) {
+	chirps, err := apiCfg.DB.GetAllChirps(r.Context())
+	if err != nil {
+		log.Printf("error getting all chirps: %s", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't get chirps")
+		return
+	}
+	response := []ChirpResponse{}
+	for _, chirp := range chirps {
+		response = append(response, ChirpResponse{
+			ID:        chirp.ID,
+			Body:      chirp.Body,
+			UserId:    chirp.UserID.String(),
+			CreatedAt: chirp.CreatedAt,
+			UpdatedAt: chirp.UpdatedAt,
+		})
+	}
+
+	helpers.ResponseWithJSON(w, http.StatusOK, response)
+
+}
+
+func (apiCfg *apiConfig) GetChirpByIdHandler(w http.ResponseWriter, r *http.Request) {
+	idStr := r.PathValue("chirpId")
+
+	chirp, err := apiCfg.DB.GetChirp(r.Context(), uuid.MustParse(idStr))
+	if err == sql.ErrNoRows {
+		helpers.ResponseWithError(w, http.StatusNotFound, "Chirp not found")
+		return
+	} else if err != nil {
+		log.Printf("error getting chirp: %s", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't get chirp")
+		return
+	}
+	helpers.ResponseWithJSON(w, http.StatusOK, ChirpResponse{
+		ID:        chirp.ID,
+		Body:      chirp.Body,
+		UserId:    chirp.UserID.String(),
+		CreatedAt: chirp.CreatedAt,
+		UpdatedAt: chirp.UpdatedAt,
+	})
+
+}
+
 func main() {
 	godotenv.Load()
 	dbURL := os.Getenv("DB_URL")
@@ -137,7 +233,11 @@ func main() {
 	mux.HandleFunc("GET /admin/metrics", apiCfg.HandlerMetrics)
 	mux.HandleFunc("POST /admin/reset", apiCfg.HandlerResetUsers)
 	mux.HandleFunc("GET /api/healthz", handlers.HandlerReady)
-	mux.HandleFunc("POST /api/chirps", handlers.HandlerValidateChirp)
+
+	mux.HandleFunc("POST /api/chirps", apiCfg.CreateChirpHandler)
+	mux.HandleFunc("GET /api/chirps", apiCfg.GetAllChirpsHandler)
+	mux.HandleFunc("GET /api/chirps/{chirpId}", apiCfg.GetChirpByIdHandler)
+
 	mux.HandleFunc("POST /api/users", apiCfg.CreateUserHandler)
 
 	server.ListenAndServe()
