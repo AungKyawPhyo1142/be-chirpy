@@ -54,22 +54,20 @@ func (api *apiConfig) middlewareMetricInc(next http.Handler) http.Handler {
 
 // ------------------- Auth --------------------------
 type LoginRequest struct {
-	Email            string `json:"email"`
-	Password         string `json:"password"`
-	ExpiresInSeconds *int   `json:"expires_in_seconds,omitempty"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
 }
 
 type LoginResponse struct {
-	ID        string    `json:"id"`
-	Email     string    `json:"email"`
-	CreatedAt time.Time `json:"created_at"`
-	UpdatedAt time.Time `json:"updated_at"`
-	Token     string    `json:"token"`
+	ID           string    `json:"id"`
+	Email        string    `json:"email"`
+	CreatedAt    time.Time `json:"created_at"`
+	UpdatedAt    time.Time `json:"updated_at"`
+	Token        string    `json:"token"`
+	RefreshToken string    `json:"refresh_token"`
 }
 
 func (api *apiConfig) LoginHandler(w http.ResponseWriter, r *http.Request) {
-
-	defaultExpiresInSeconds := 3600 // 1hr
 
 	decoder := json.NewDecoder(r.Body)
 	parsed := LoginRequest{}
@@ -78,10 +76,6 @@ func (api *apiConfig) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("error decoding request body: %s", err)
 		helpers.ResponseWithError(w, http.StatusInternalServerError, "Something went wrong")
 		return
-	}
-
-	if parsed.ExpiresInSeconds == nil {
-		parsed.ExpiresInSeconds = &defaultExpiresInSeconds
 	}
 
 	dbUser, err := api.DB.GetUserByEmail(r.Context(), parsed.Email)
@@ -106,22 +100,101 @@ func (api *apiConfig) LoginHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	token, err := auth.MakeJWT(dbUser.ID, api.JWTSecret, time.Duration(*parsed.ExpiresInSeconds)*time.Second)
+	token, err := auth.MakeJWT(dbUser.ID, api.JWTSecret, time.Hour)
 	if err != nil {
 		log.Printf("error making token: %s", err)
 		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't make JWT token")
 		return
 	}
 
+	refreshToken, err := auth.MakeRefreshToken()
+	if err != nil {
+		log.Printf("error making refresh token: %s", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't make refresh token")
+		return
+	}
+
+	dbRefreshToken, err := api.DB.CreateRefreshToken(r.Context(), database.CreateRefreshTokenParams{
+		Token:     refreshToken,
+		UserID:    dbUser.ID,
+		ExpiresAt: time.Now().Add(time.Hour * 24 * 60),
+	})
+
 	response := LoginResponse{
-		ID:        dbUser.ID.String(),
-		Email:     dbUser.Email,
-		CreatedAt: dbUser.CreatedAt,
-		UpdatedAt: dbUser.UpdatedAt,
-		Token:     token,
+		ID:           dbUser.ID.String(),
+		Email:        dbUser.Email,
+		CreatedAt:    dbUser.CreatedAt,
+		UpdatedAt:    dbUser.UpdatedAt,
+		Token:        token,
+		RefreshToken: dbRefreshToken.Token,
 	}
 
 	helpers.ResponseWithJSON(w, http.StatusOK, response)
+
+}
+
+func (api *apiConfig) RefreshHandler(w http.ResponseWriter, r *http.Request) {
+
+	refreshToken, err := auth.GetRefreshToken(r.Header)
+	if err != nil {
+		log.Printf("error getting refresh token: %v", err)
+		helpers.ResponseWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	dbRefreshToken, err := api.DB.GetRefreshToken(r.Context(), refreshToken)
+	if err == sql.ErrNoRows {
+		helpers.ResponseWithError(w, http.StatusUnauthorized, "Refresh Token Not Found!")
+		return
+	}
+
+	if dbRefreshToken.ExpiresAt.Before(time.Now()) {
+		helpers.ResponseWithError(w, http.StatusUnauthorized, "Refresh Token Expired")
+		return
+	}
+
+	if dbRefreshToken.RevokedAt.Valid {
+		helpers.ResponseWithError(w, http.StatusUnauthorized, "Refresh Token Revoked")
+		return
+	}
+
+	dbUser, err := api.DB.GetUserFromRefreshToken(r.Context(), dbRefreshToken.Token)
+	if err != nil {
+		log.Printf("error getting user from refresh token: %v", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't get user")
+		return
+	}
+
+	newToken, err := auth.MakeJWT(dbUser.ID, api.JWTSecret, time.Hour)
+	if err != nil {
+		log.Printf("error making token: %s", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't make JWT token")
+		return
+	}
+
+	helpers.ResponseWithJSON(w, http.StatusOK, struct {
+		Token string `json:"token"`
+	}{
+		Token: newToken,
+	})
+
+}
+
+func (api *apiConfig) RevokeHandler(w http.ResponseWriter, r *http.Request) {
+	refreshToken, err := auth.GetRefreshToken(r.Header)
+	if err != nil {
+		log.Printf("error getting refresh token: %v", err)
+		helpers.ResponseWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
+	if err := api.DB.RevokeRefreshToken(r.Context(), refreshToken); err != nil {
+		log.Printf("error revoking refresh token: %v", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't revoke refresh token")
+		return
+	}
+
+	helpers.ResponseWithJSON(w, http.StatusNoContent, struct{}{})
 
 }
 
@@ -345,6 +418,8 @@ func main() {
 	mux.HandleFunc("POST /api/users", apiCfg.CreateUserHandler)
 
 	mux.HandleFunc("POST /api/login", apiCfg.LoginHandler)
+	mux.HandleFunc("POST /api/refresh", apiCfg.RefreshHandler)
+	mux.HandleFunc("POST /api/revoke", apiCfg.RevokeHandler)
 
 	server.ListenAndServe()
 
