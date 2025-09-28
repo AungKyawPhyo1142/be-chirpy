@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/AungKyawPhyo1142/chirpy/handlers"
+	"github.com/AungKyawPhyo1142/chirpy/internal/auth"
 	"github.com/AungKyawPhyo1142/chirpy/internal/database"
 	"github.com/joho/godotenv"
 	_ "github.com/lib/pq"
@@ -24,6 +25,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	DB             *database.Queries
 	Platfrom       string
+	JWTSecret      string
 }
 
 func (api *apiConfig) HandlerMetrics(w http.ResponseWriter, r *http.Request) {
@@ -50,9 +52,83 @@ func (api *apiConfig) middlewareMetricInc(next http.Handler) http.Handler {
 	})
 }
 
+// ------------------- Auth --------------------------
+type LoginRequest struct {
+	Email            string `json:"email"`
+	Password         string `json:"password"`
+	ExpiresInSeconds *int   `json:"expires_in_seconds,omitempty"`
+}
+
+type LoginResponse struct {
+	ID        string    `json:"id"`
+	Email     string    `json:"email"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+	Token     string    `json:"token"`
+}
+
+func (api *apiConfig) LoginHandler(w http.ResponseWriter, r *http.Request) {
+
+	defaultExpiresInSeconds := 3600 // 1hr
+
+	decoder := json.NewDecoder(r.Body)
+	parsed := LoginRequest{}
+
+	if err := decoder.Decode(&parsed); err != nil {
+		log.Printf("error decoding request body: %s", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Something went wrong")
+		return
+	}
+
+	if parsed.ExpiresInSeconds == nil {
+		parsed.ExpiresInSeconds = &defaultExpiresInSeconds
+	}
+
+	dbUser, err := api.DB.GetUserByEmail(r.Context(), parsed.Email)
+	if err == sql.ErrNoRows {
+		helpers.ResponseWithError(w, http.StatusUnauthorized, "Incorrect email or password")
+		return
+	} else if err != nil {
+		log.Printf("error getting user: %s", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't get user")
+		return
+	}
+
+	authorized, err := auth.CheckPasswordHash(parsed.Password, dbUser.HashedPassword)
+	if err != nil {
+		log.Printf("error checking password: %s", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't check password")
+		return
+	}
+
+	if !authorized {
+		helpers.ResponseWithError(w, http.StatusUnauthorized, "Incorrect email or password")
+		return
+	}
+
+	token, err := auth.MakeJWT(dbUser.ID, api.JWTSecret, time.Duration(*parsed.ExpiresInSeconds)*time.Second)
+	if err != nil {
+		log.Printf("error making token: %s", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't make JWT token")
+		return
+	}
+
+	response := LoginResponse{
+		ID:        dbUser.ID.String(),
+		Email:     dbUser.Email,
+		CreatedAt: dbUser.CreatedAt,
+		UpdatedAt: dbUser.UpdatedAt,
+		Token:     token,
+	}
+
+	helpers.ResponseWithJSON(w, http.StatusOK, response)
+
+}
+
 // ------------------- Users --------------------------
 type CreateUserRequest struct {
-	Email string `json:"email"`
+	Email    string `json:"email"`
+	Password string `json:"password"`
 }
 
 type UserResponse struct {
@@ -72,7 +148,18 @@ func (api *apiConfig) CreateUserHandler(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	user, err := api.DB.CreateUser(r.Context(), reqBody.Email)
+	hashed, err := auth.HashPassword(reqBody.Password)
+	if err != nil {
+		log.Printf("error hashing password: %s", err)
+		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't hash password")
+		return
+	}
+	reqBody.Password = hashed
+
+	user, err := api.DB.CreateUser(r.Context(), database.CreateUserParams{
+		Email:          reqBody.Email,
+		HashedPassword: reqBody.Password,
+	})
 	if err != nil {
 		log.Printf("error creating user: %s", err)
 		helpers.ResponseWithError(w, http.StatusInternalServerError, "Couldn't create user")
@@ -107,8 +194,7 @@ func (api *apiConfig) HandlerResetUsers(w http.ResponseWriter, r *http.Request) 
 
 // ------------------- Chirps --------------------------
 type CreateChirpRequest struct {
-	Body   string `json:"body"`
-	UserId string `json:"user_id"`
+	Body string `json:"body"`
 }
 
 type ChirpResponse struct {
@@ -120,6 +206,20 @@ type ChirpResponse struct {
 }
 
 func (apiCfg *apiConfig) CreateChirpHandler(w http.ResponseWriter, r *http.Request) {
+
+	bearerToken, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+		log.Printf("error getting bearer token: %s", err)
+		helpers.ResponseWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+	userId, err := auth.ValidateJWT(bearerToken, apiCfg.JWTSecret)
+	if err != nil {
+		log.Printf("error validating token: %s", err)
+		helpers.ResponseWithError(w, http.StatusUnauthorized, "Unauthorized")
+		return
+	}
+
 	decoder := json.NewDecoder(r.Body)
 	req_body := CreateChirpRequest{}
 
@@ -138,7 +238,7 @@ func (apiCfg *apiConfig) CreateChirpHandler(w http.ResponseWriter, r *http.Reque
 
 	chirp, err := apiCfg.DB.CreateChirp(r.Context(), database.CreateChirpParams{
 		Body:   cleaned,
-		UserID: uuid.MustParse(req_body.UserId),
+		UserID: userId,
 	})
 	if err != nil {
 		log.Printf("error creating chirp: %s", err)
@@ -148,7 +248,7 @@ func (apiCfg *apiConfig) CreateChirpHandler(w http.ResponseWriter, r *http.Reque
 
 	helpers.ResponseWithJSON(w, http.StatusCreated, ChirpResponse{
 		Body:      chirp.Body,
-		UserId:    chirp.UserID.String(),
+		UserId:    userId.String(),
 		CreatedAt: chirp.CreatedAt,
 		UpdatedAt: chirp.UpdatedAt,
 		ID:        chirp.ID,
@@ -202,6 +302,9 @@ func (apiCfg *apiConfig) GetChirpByIdHandler(w http.ResponseWriter, r *http.Requ
 
 func main() {
 	godotenv.Load()
+
+	tokenSecret := os.Getenv("JWT_SECRET")
+
 	dbURL := os.Getenv("DB_URL")
 	if dbURL == "" {
 		panic("DB_URL is not set")
@@ -223,6 +326,7 @@ func main() {
 		fileserverHits: atomic.Int32{},
 		DB:             dbQueries,
 		Platfrom:       platform,
+		JWTSecret:      tokenSecret,
 	}
 
 	var server http.Server
@@ -239,6 +343,8 @@ func main() {
 	mux.HandleFunc("GET /api/chirps/{chirpId}", apiCfg.GetChirpByIdHandler)
 
 	mux.HandleFunc("POST /api/users", apiCfg.CreateUserHandler)
+
+	mux.HandleFunc("POST /api/login", apiCfg.LoginHandler)
 
 	server.ListenAndServe()
 
