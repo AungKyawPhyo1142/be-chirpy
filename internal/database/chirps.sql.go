@@ -33,13 +33,25 @@ func (q *Queries) CreateChirp(ctx context.Context, arg CreateChirpParams) (Chirp
 	return i, err
 }
 
-const getAllChirps = `-- name: GetAllChirps :many
-SELECT id, body, created_at, updated_at, user_id FROM chirps
-ORDER BY created_at ASC
+const deleteChirp = `-- name: DeleteChirp :exec
+DELETE FROM chirps
+WHERE id = $1
 `
 
-func (q *Queries) GetAllChirps(ctx context.Context) ([]Chirp, error) {
-	rows, err := q.db.QueryContext(ctx, getAllChirps)
+func (q *Queries) DeleteChirp(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.ExecContext(ctx, deleteChirp, id)
+	return err
+}
+
+const getAllChirps = `-- name: GetAllChirps :many
+SELECT id, body, created_at, updated_at, user_id FROM chirps
+ORDER BY
+    CASE WHEN $1::text = 'asc' THEN created_at END ASC,
+    CASE WHEN $1::text = 'desc' THEN created_at END DESC
+`
+
+func (q *Queries) GetAllChirps(ctx context.Context, sortDirection string) ([]Chirp, error) {
+	rows, err := q.db.QueryContext(ctx, getAllChirps, sortDirection)
 	if err != nil {
 		return nil, err
 	}
@@ -83,4 +95,46 @@ func (q *Queries) GetChirp(ctx context.Context, id uuid.UUID) (Chirp, error) {
 		&i.UserID,
 	)
 	return i, err
+}
+
+const getChirpsByUserID = `-- name: GetChirpsByUserID :many
+SELECT id, body, created_at, updated_at, user_id FROM chirps
+WHERE user_id = $1
+ORDER BY
+    CASE WHEN $2::text = 'asc' THEN created_at END ASC,
+    CASE WHEN $2::text = 'desc' THEN created_at END DESC
+`
+
+type GetChirpsByUserIDParams struct {
+	UserID        uuid.UUID
+	SortDirection string
+}
+
+func (q *Queries) GetChirpsByUserID(ctx context.Context, arg GetChirpsByUserIDParams) ([]Chirp, error) {
+	rows, err := q.db.QueryContext(ctx, getChirpsByUserID, arg.UserID, arg.SortDirection)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Chirp
+	for rows.Next() {
+		var i Chirp
+		if err := rows.Scan(
+			&i.ID,
+			&i.Body,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.UserID,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
